@@ -13,6 +13,7 @@ let waiting = null;
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  // Ищем партнёра
   socket.on("find_partner", () => {
     if (waiting) {
       const partner = waiting;
@@ -28,12 +29,24 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Отправка сообщений
   socket.on("message", (msg) => {
     if (socket.partner) {
       io.to(socket.partner).emit("message", msg);
     }
   });
 
+  // Завершение чата кнопкой "Закончить"
+  socket.on("finish_chat", () => {
+    if (socket.partner) {
+      io.to(socket.partner).emit("partner_left");
+      const partnerSocket = io.sockets.sockets.get(socket.partner);
+      if (partnerSocket) partnerSocket.partner = null;
+      socket.partner = null;
+    }
+  });
+
+  // Отключение пользователя
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
     if (waiting && waiting.id === socket.id) {
@@ -41,10 +54,14 @@ io.on("connection", (socket) => {
     }
     if (socket.partner) {
       io.to(socket.partner).emit("partner_left");
+      const partnerSocket = io.sockets.sockets.get(socket.partner);
+      if (partnerSocket) partnerSocket.partner = null;
+      socket.partner = null;
     }
   });
 });
 
-server.listen(3000, () => {
-  console.log("Server running on port 3000");
+// Запуск сервера
+server.listen(process.env.PORT || 3000, () => {
+  console.log("Server running");
 });
