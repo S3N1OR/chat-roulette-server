@@ -1,3 +1,4 @@
+// server.js
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -13,9 +14,10 @@ let waiting = null;
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // Ищем партнёра
+  // КОМАНДА: find_partner
   socket.on("find_partner", () => {
-    if (waiting) {
+    // Если уже есть ожидающий и это не тот же самый сокет — свяжем
+    if (waiting && waiting.id !== socket.id) {
       const partner = waiting;
       waiting = null;
 
@@ -24,29 +26,48 @@ io.on("connection", (socket) => {
 
       socket.emit("partner_found", { partnerId: partner.id });
       partner.emit("partner_found", { partnerId: socket.id });
+
+      console.log("Paired:", socket.id, "<->", partner.id);
     } else {
-      waiting = socket;
+      // Если waiting === socket (кейс, когда тот же клиент повторно послал find), игнорируем и оставляем его ждать
+      // Если waiting == null — назначаем
+      if (!waiting) {
+        waiting = socket;
+        console.log("Waiting set to:", socket.id);
+      } else if (waiting.id === socket.id) {
+        // уже ждёт - ничего не делаем
+        console.log("Socket already waiting:", socket.id);
+      }
     }
   });
 
-  // Отправка сообщений
+  // Отправка сообщения партнеру
   socket.on("message", (msg) => {
     if (socket.partner) {
       io.to(socket.partner).emit("message", msg);
     }
   });
 
-  // Завершение чата кнопкой "Закончить"
+  // Пользователь нажал "Завершить" (чистый выход из чата)
   socket.on("finish_chat", () => {
     if (socket.partner) {
+      // уведомляем партнёра
       io.to(socket.partner).emit("partner_left");
+      // снять связь
       const partnerSocket = io.sockets.sockets.get(socket.partner);
       if (partnerSocket) partnerSocket.partner = null;
       socket.partner = null;
+      console.log("Finish chat: notified partner of", socket.id);
+    } else {
+      // если просто был в ожидании, переставляем waiting
+      if (waiting && waiting.id === socket.id) {
+        waiting = null;
+        console.log("Finish chat while waiting:", socket.id);
+      }
     }
   });
 
-  // Отключение пользователя
+  // Отключение сокета
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
     if (waiting && waiting.id === socket.id) {
@@ -61,7 +82,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// Запуск сервера
 server.listen(process.env.PORT || 3000, () => {
-  console.log("Server running");
+  console.log("Server running on port", process.env.PORT || 3000);
 });
