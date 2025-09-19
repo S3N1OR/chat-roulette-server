@@ -1,87 +1,85 @@
-// server.js
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
+// server/index.js
+import http from "http";
+import { Server } from "socket.io";
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+const server = http.createServer();
+const io = new Server(server, { cors: { origin: "*" } });
 
-let waiting = null;
+const profiles = new Map(); // socket.id -> { gender, age, country }
+const waiting = [];         // очередь: [{ id, filters }]
+
+function passFilter(targetProfile, filters) {
+  if (!targetProfile) return false;
+  // пол
+  if (filters.gender && filters.gender !== "any") {
+    if (targetProfile.gender !== filters.gender) return false;
+  }
+  // возраст
+  const aMin = Number(filters.ageMin ?? 18);
+  const aMax = Number(filters.ageMax ?? 99);
+  if (targetProfile.age < aMin || targetProfile.age > aMax) return false;
+  // страна
+  if (typeof filters.country === "string" && filters.country.length > 0) {
+    if ((targetProfile.country || "") !== filters.country) return false;
+  }
+  return true;
+}
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  socket.on("update_profile", (p) => {
+    // нормализуем
+    const profile = {
+      gender: p?.gender ?? "any",
+      age: Number(p?.age ?? 18),
+      country: (p?.country ?? "").toUpperCase(),
+    };
+    profiles.set(socket.id, profile);
+  });
 
-  // КОМАНДА: find_partner
-  socket.on("find_partner", () => {
-    // Если уже есть ожидающий и это не тот же самый сокет — свяжем
-    if (waiting && waiting.id !== socket.id) {
-      const partner = waiting;
-      waiting = null;
+  socket.on("find_partner", (filters) => {
+    const myFilters = {
+      gender: filters?.gender ?? "any",
+      ageMin: Number(filters?.ageMin ?? 18),
+      ageMax: Number(filters?.ageMax ?? 99),
+      country: (filters?.country ?? "").toUpperCase(),
+    };
+    // пытаемся найти взаимный матч
+    const myProfile = profiles.get(socket.id) || { gender: "any", age: 18, country: "" };
 
-      socket.partner = partner.id;
-      partner.partner = socket.id;
+    for (let i = 0; i < waiting.length; i++) {
+      const candidate = waiting[i];
+      const candProfile = profiles.get(candidate.id);
+      if (!candProfile) { waiting.splice(i,1); i--; continue; }
 
-      socket.emit("partner_found", { partnerId: partner.id });
-      partner.emit("partner_found", { partnerId: socket.id });
-
-      console.log("Paired:", socket.id, "<->", partner.id);
-    } else {
-      // Если waiting === socket (кейс, когда тот же клиент повторно послал find), игнорируем и оставляем его ждать
-      // Если waiting == null — назначаем
-      if (!waiting) {
-        waiting = socket;
-        console.log("Waiting set to:", socket.id);
-      } else if (waiting.id === socket.id) {
-        // уже ждёт - ничего не делаем
-        console.log("Socket already waiting:", socket.id);
+      const a = passFilter(candProfile, myFilters);        // кандидат удовлетворяет моим фильтрам
+      const b = passFilter(myProfile, candidate.filters);  // я удовлетворяю его фильтрам
+      if (a && b) {
+        waiting.splice(i, 1);
+        io.to(candidate.id).emit("partner_found", { partnerId: candidate.id });
+        io.to(socket.id).emit("partner_found", { partnerId: socket.id });
+        return;
       }
     }
+
+    // не нашли — встаём в очередь
+    // заменяем прежнюю заявку, если была
+    const idx = waiting.findIndex(w => w.id === socket.id);
+    const entry = { id: socket.id, filters: myFilters };
+    if (idx >= 0) waiting[idx] = entry; else waiting.push(entry);
   });
 
-  // Отправка сообщения партнеру
-  socket.on("message", (msg) => {
-    if (socket.partner) {
-      io.to(socket.partner).emit("message", msg);
-    }
-  });
-
-  // Пользователь нажал "Завершить" (чистый выход из чата)
   socket.on("finish_chat", () => {
-    if (socket.partner) {
-      // уведомляем партнёра
-      io.to(socket.partner).emit("partner_left");
-      // снять связь
-      const partnerSocket = io.sockets.sockets.get(socket.partner);
-      if (partnerSocket) partnerSocket.partner = null;
-      socket.partner = null;
-      console.log("Finish chat: notified partner of", socket.id);
-    } else {
-      // если просто был в ожидании, переставляем waiting
-      if (waiting && waiting.id === socket.id) {
-        waiting = null;
-        console.log("Finish chat while waiting:", socket.id);
-      }
-    }
+    const idx = waiting.findIndex(w => w.id === socket.id);
+    if (idx >= 0) waiting.splice(idx, 1);
   });
 
-  // Отключение сокета
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-    if (waiting && waiting.id === socket.id) {
-      waiting = null;
-    }
-    if (socket.partner) {
-      io.to(socket.partner).emit("partner_left");
-      const partnerSocket = io.sockets.sockets.get(socket.partner);
-      if (partnerSocket) partnerSocket.partner = null;
-      socket.partner = null;
-    }
+    profiles.delete(socket.id);
+    const idx = waiting.findIndex(w => w.id === socket.id);
+    if (idx >= 0) waiting.splice(idx, 1);
   });
 });
 
 server.listen(process.env.PORT || 3000, () => {
-  console.log("Server running on port", process.env.PORT || 3000);
+  console.log("Matcher listening");
 });
