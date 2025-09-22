@@ -11,33 +11,63 @@ const io = new Server(server, {
 // очередь ожидания
 let waiting = [];
 
+// 🔹 функция: проверка попадания возраста в диапазон
+function ageInRange(age, rangeKey) {
+  const n = parseInt(age, 10);
+  if (isNaN(n)) return false;
+
+  switch (rangeKey) {
+    case "<18":
+      return n < 18;
+    case "18-22":
+      return n >= 18 && n <= 22;
+    case "23-33":
+      return n >= 23 && n <= 33;
+    case "34+":
+      return n >= 34;
+    default:
+      return false;
+  }
+}
+
+// 🔹 проверка совместимости по фильтрам
+function matches(me, other) {
+  if (!other) return false;
+
+  // пол
+  const genderOk = me.targetGender === "any" || me.targetGender === other.myGender;
+  const partnerGenderOk = other.targetGender === "any" || other.targetGender === me.myGender;
+
+  // возраст
+  const ageOk =
+    !me.targetAges?.length ||
+    me.targetAges.some((r) => ageInRange(other.myAge, r));
+
+  const partnerAgeOk =
+    !other.targetAges?.length ||
+    other.targetAges.some((r) => ageInRange(me.myAge, r));
+
+  return genderOk && partnerGenderOk && ageOk && partnerAgeOk;
+}
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // 🔹 Поиск партнёра с учётом фильтров
   socket.on("find_partner", (data) => {
-    const { myGender, myAge, targetGender, targetAge } = data;
-    socket.profile = { myGender, myAge, targetGender, targetAge };
+    const { myGender, myAge, targetGender, targetAges } = data;
+    socket.profile = {
+      myGender,
+      myAge,
+      targetGender,
+      targetAges: Array.isArray(targetAges) ? targetAges : [],
+    };
 
     console.log("Searching:", socket.id, socket.profile);
 
-    // найти совместимого из очереди
-    let partnerIndex = waiting.findIndex((s) => {
-      if (!s.profile) return false;
-      const p = s.profile;
-
-      // условия совпадения: я удовлетворяю фильтры собеседника и он удовлетворяет мои
-      const matchForMe =
-        (p.myGender === targetGender || targetGender === "any") &&
-        (targetGender === "any" || true) &&
-        (targetAge === "any" || p.myAge === targetAge);
-
-      const matchForPartner =
-        (myGender === p.targetGender || p.targetGender === "any") &&
-        (p.targetAge === "any" || myAge === p.targetAge);
-
-      return matchForMe && matchForPartner;
-    });
+    // найти совместимого собеседника
+    let partnerIndex = waiting.findIndex((s) =>
+      matches(socket.profile, s.profile)
+    );
 
     if (partnerIndex !== -1) {
       const partner = waiting[partnerIndex];
@@ -56,14 +86,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Сообщения
   socket.on("message", (msg) => {
     if (socket.partner) {
       io.to(socket.partner).emit("message", msg);
     }
   });
 
-  // Завершить чат
   socket.on("finish_chat", () => {
     if (socket.partner) {
       io.to(socket.partner).emit("partner_left");
@@ -75,7 +103,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Отключение
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
     waiting = waiting.filter((s) => s.id !== socket.id);
