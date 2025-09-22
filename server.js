@@ -57,7 +57,7 @@ io.on("connection", (socket) => {
     const { myGender, myAge, targetGender, targetAges } = data;
     socket.profile = {
       myGender,
-      myAge,
+      myAge: parseInt(myAge, 10) || 0, // 🔹 приводим к числу
       targetGender,
       targetAges: Array.isArray(targetAges) ? targetAges : [],
     };
@@ -94,7 +94,7 @@ io.on("connection", (socket) => {
 
   socket.on("finish_chat", () => {
     if (socket.partner) {
-      io.to(socket.partner).emit("partner_left");
+      io.to(socket.partner).emit("partner_left"); // 🔹 уведомляем
       const partnerSocket = io.sockets.sockets.get(socket.partner);
       if (partnerSocket) partnerSocket.partner = null;
       socket.partner = null;
