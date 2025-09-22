@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -9,17 +8,40 @@ const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-let waiting = null;
+// очередь ожидания
+let waiting = [];
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // КОМАНДА: find_partner
-  socket.on("find_partner", () => {
-    // Если уже есть ожидающий и это не тот же самый сокет — свяжем
-    if (waiting && waiting.id !== socket.id) {
-      const partner = waiting;
-      waiting = null;
+  // 🔹 Поиск партнёра с учётом фильтров
+  socket.on("find_partner", (data) => {
+    const { myGender, myAge, targetGender, targetAge } = data;
+    socket.profile = { myGender, myAge, targetGender, targetAge };
+
+    console.log("Searching:", socket.id, socket.profile);
+
+    // найти совместимого из очереди
+    let partnerIndex = waiting.findIndex((s) => {
+      if (!s.profile) return false;
+      const p = s.profile;
+
+      // условия совпадения: я удовлетворяю фильтры собеседника и он удовлетворяет мои
+      const matchForMe =
+        (p.myGender === targetGender || targetGender === "any") &&
+        (targetGender === "any" || true) &&
+        (targetAge === "any" || p.myAge === targetAge);
+
+      const matchForPartner =
+        (myGender === p.targetGender || p.targetGender === "any") &&
+        (p.targetAge === "any" || myAge === p.targetAge);
+
+      return matchForMe && matchForPartner;
+    });
+
+    if (partnerIndex !== -1) {
+      const partner = waiting[partnerIndex];
+      waiting.splice(partnerIndex, 1);
 
       socket.partner = partner.id;
       partner.partner = socket.id;
@@ -29,50 +51,34 @@ io.on("connection", (socket) => {
 
       console.log("Paired:", socket.id, "<->", partner.id);
     } else {
-      // Если waiting === socket (кейс, когда тот же клиент повторно послал find), игнорируем и оставляем его ждать
-      // Если waiting == null — назначаем
-      if (!waiting) {
-        waiting = socket;
-        console.log("Waiting set to:", socket.id);
-      } else if (waiting.id === socket.id) {
-        // уже ждёт - ничего не делаем
-        console.log("Socket already waiting:", socket.id);
-      }
+      waiting.push(socket);
+      console.log("Added to waiting:", socket.id);
     }
   });
 
-  // Отправка сообщения партнеру
+  // Сообщения
   socket.on("message", (msg) => {
     if (socket.partner) {
       io.to(socket.partner).emit("message", msg);
     }
   });
 
-  // Пользователь нажал "Завершить" (чистый выход из чата)
+  // Завершить чат
   socket.on("finish_chat", () => {
     if (socket.partner) {
-      // уведомляем партнёра
       io.to(socket.partner).emit("partner_left");
-      // снять связь
       const partnerSocket = io.sockets.sockets.get(socket.partner);
       if (partnerSocket) partnerSocket.partner = null;
       socket.partner = null;
-      console.log("Finish chat: notified partner of", socket.id);
     } else {
-      // если просто был в ожидании, переставляем waiting
-      if (waiting && waiting.id === socket.id) {
-        waiting = null;
-        console.log("Finish chat while waiting:", socket.id);
-      }
+      waiting = waiting.filter((s) => s.id !== socket.id);
     }
   });
 
-  // Отключение сокета
+  // Отключение
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
-    if (waiting && waiting.id === socket.id) {
-      waiting = null;
-    }
+    waiting = waiting.filter((s) => s.id !== socket.id);
     if (socket.partner) {
       io.to(socket.partner).emit("partner_left");
       const partnerSocket = io.sockets.sockets.get(socket.partner);
