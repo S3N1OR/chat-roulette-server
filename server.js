@@ -4,24 +4,20 @@ const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
-// Очередь ожидания
+// Очередь ожидания (сокеты)
 let waiting = [];
 
-// Допустимые ключи диапазонов
-const ALLOWED_RANGE_KEYS = new Set(["<18", "18-22", "23-33", "34+"]);
+// Допустимые возрастные диапазоны (18+)
+const ALLOWED_RANGES = new Set(["18-22", "23-33", "34+"]);
 
-// Возраст попадает в диапазон?
+// Попадание возраста в диапазон (18+)
 function ageInRange(age, rangeKey) {
   const n = parseInt(age, 10);
   if (Number.isNaN(n)) return false;
 
   switch (rangeKey) {
-    case "<18":
-      return n < 18;
     case "18-22":
       return n >= 18 && n <= 22;
     case "23-33":
@@ -33,80 +29,89 @@ function ageInRange(age, rangeKey) {
   }
 }
 
-// Нормализация профиля, пришедшего от клиента
-function normalizeProfile(data = {}) {
-  const g = (data.myGender || "any").toString();
-  const tg = (data.targetGender || "any").toString();
-  const myAgeNum = parseInt(data.myAge, 10);
-  const myAge = Number.isFinite(myAgeNum) ? myAgeNum : 0;
-
-  // Поддержка старых клиентов: targetAge (один ключ) -> массив
-  let rawRanges = Array.isArray(data.targetAges)
-    ? data.targetAges
-    : (data.targetAge ? [data.targetAge] : []);
-
-  // Строка с JSON? Попробуем распарсить (на всякий случай)
-  if (!Array.isArray(rawRanges) && typeof rawRanges === "string") {
-    try {
-      const parsed = JSON.parse(rawRanges);
-      if (Array.isArray(parsed)) rawRanges = parsed;
-    } catch {}
-  }
-
-  // Фильтруем только разрешённые ключи
-  const targetAges = (rawRanges || [])
-    .map(String)
-    .filter((k) => ALLOWED_RANGE_KEYS.has(k));
-
-  return {
-    myGender: g === "male" || g === "female" ? g : "any",
-    myAge,
-    targetGender: tg === "male" || tg === "female" ? tg : "any",
-    targetAges, // массив ключей диапазонов
-  };
-}
-
-// Проверка совместимости двух сторон (оба фильтруют друг друга)
+// Совместимость по полу, возрасту и стране (обоюдно)
 function matches(me, other) {
-  if (!me || !other) return false;
+  if (!other) return false;
 
-  // Пол
-  const meGenderOk =
+  // пол
+  const genderOk =
     me.targetGender === "any" || me.targetGender === other.myGender;
-  const otherGenderOk =
+  const partnerGenderOk =
     other.targetGender === "any" || other.targetGender === me.myGender;
 
-  // Возраст (если массив пуст — фильтр не задан)
-  const meAgeOk =
-    me.targetAges.length === 0 ||
-    me.targetAges.some((rk) => ageInRange(other.myAge, rk));
+  // возраст
+  const ageOk =
+    !me.targetAges.length || me.targetAges.some((r) => ageInRange(other.myAge, r));
+  const partnerAgeOk =
+    !other.targetAges.length || other.targetAges.some((r) => ageInRange(me.myAge, r));
 
-  const otherAgeOk =
-    other.targetAges.length === 0 ||
-    other.targetAges.some((rk) => ageInRange(me.myAge, rk));
+  // страна
+  const countryOk =
+    !me.targetCountry || me.targetCountry === "any" || me.targetCountry === other.myCountry;
+  const partnerCountryOk =
+    !other.targetCountry || other.targetCountry === "any" || other.targetCountry === me.myCountry;
 
-  return meGenderOk && otherGenderOk && meAgeOk && otherAgeOk;
+  return genderOk && partnerGenderOk && ageOk && partnerAgeOk && countryOk && partnerCountryOk;
+}
+
+// Удалить сокет из очереди ожидания (если там есть)
+function dropFromWaiting(sock) {
+  const idx = waiting.findIndex((s) => s.id === sock.id);
+  if (idx !== -1) waiting.splice(idx, 1);
+}
+
+// Посчитать количество ожидающих по странам
+function getCountryCounts() {
+  const counts = {};
+  for (const s of waiting) {
+    const c = (s.profile?.myCountry || "any");
+    if (!counts[c]) counts[c] = 0;
+    counts[c] += 1;
+  }
+  return counts;
 }
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  socket.on("find_partner", (payload) => {
-    // Нормализуем профиль
-    socket.profile = normalizeProfile(payload);
-    console.log("Searching:", socket.id, socket.profile);
+  // Клиент запрашивает статистику стран (ack callback)
+  socket.on("get_country_counts", (ack) => {
+    try {
+      const counts = getCountryCounts();
+      if (typeof ack === "function") ack({ ok: true, counts });
+    } catch (e) {
+      if (typeof ack === "function") ack({ ok: false, error: String(e) });
+    }
+  });
 
-    // Из очереди убираем все старые вхождения этого сокета (на всякий)
-    waiting = waiting.filter((s) => s.id !== socket.id && s.connected);
+  socket.on("find_partner", (data = {}) => {
+    // Чистим возможную старую запись ожидания
+    dropFromWaiting(socket);
+    socket.partner = null;
 
-    // Ищем совместимого
-    const idx = waiting.findIndex(
-      (s) => s && s.profile && matches(socket.profile, s.profile)
-    );
+    // Нормализация профиля
+    const myGender =
+      data.myGender === "male" || data.myGender === "female" ? data.myGender : "any";
+    const myAge = parseInt(data.myAge, 10) || 18; // 18+ по умолчанию
+    const myCountry = (data.myCountry && String(data.myCountry)) || "any";
 
-    if (idx !== -1) {
-      const partner = waiting[idx];
-      waiting.splice(idx, 1);
+    // Нормализация фильтров
+    const targetGender =
+      data.targetGender === "male" || data.targetGender === "female" ? data.targetGender : "any";
+
+    let targetAges = Array.isArray(data.targetAges) ? data.targetAges : [];
+    targetAges = targetAges.filter((k) => ALLOWED_RANGES.has(k));
+
+    const targetCountry =
+      data.targetCountry && String(data.targetCountry).length ? String(data.targetCountry) : "any";
+
+    socket.profile = { myGender, myAge, myCountry, targetGender, targetAges, targetCountry };
+
+    // Пытаемся найти пару
+    const partnerIndex = waiting.findIndex((s) => matches(socket.profile, s.profile));
+    if (partnerIndex !== -1) {
+      const partner = waiting[partnerIndex];
+      waiting.splice(partnerIndex, 1);
 
       socket.partner = partner.id;
       partner.partner = socket.id;
@@ -114,53 +119,38 @@ io.on("connection", (socket) => {
       socket.emit("partner_found", { partnerId: partner.id });
       partner.emit("partner_found", { partnerId: socket.id });
 
-      console.log("Paired:", socket.id, "<->", partner.id);
+      console.log("Paired:", socket.id, "<->", partner.id, {
+        me: socket.profile,
+        other: partner.profile,
+      });
     } else {
-      // Никого подходящего — добавляем в очередь
       waiting.push(socket);
-      console.log("Added to waiting:", socket.id);
+      console.log("Added to waiting:", socket.id, socket.profile);
     }
   });
 
   socket.on("message", (msg) => {
-    if (socket.partner) {
-      io.to(socket.partner).emit("message", msg);
-    }
+    if (socket.partner) io.to(socket.partner).emit("message", msg);
   });
 
   socket.on("finish_chat", () => {
-    // Уведомляем партнёра и разрываем связь
+    dropFromWaiting(socket);
     if (socket.partner) {
-      const partnerId = socket.partner;
-      socket.partner = null;
-
-      io.to(partnerId).emit("partner_left");
-
-      const partnerSocket = io.sockets.sockets.get(partnerId);
+      io.to(socket.partner).emit("partner_left");
+      const partnerSocket = io.sockets.sockets.get(socket.partner);
       if (partnerSocket) partnerSocket.partner = null;
-
-      console.log("Finish chat:", socket.id, "-> notify", partnerId);
-    } else {
-      // Если был в ожидании — убираем из очереди
-      waiting = waiting.filter((s) => s.id !== socket.id);
-      console.log("Finish while waiting:", socket.id);
+      socket.partner = null;
     }
   });
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
-
-    // Удаляем из очереди
-    waiting = waiting.filter((s) => s.id !== socket.id);
-
+    dropFromWaiting(socket);
     if (socket.partner) {
-      const partnerId = socket.partner;
-      io.to(partnerId).emit("partner_left");
-      const partnerSocket = io.sockets.sockets.get(partnerId);
+      io.to(socket.partner).emit("partner_left");
+      const partnerSocket = io.sockets.sockets.get(socket.partner);
       if (partnerSocket) partnerSocket.partner = null;
       socket.partner = null;
-
-      console.log("Disconnected -> notify partner:", partnerId);
     }
   });
 });
