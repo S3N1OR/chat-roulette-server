@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ====== Конфиг администратора ======
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme_admin_token";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "Pers__2006)";
 
 // ====== Простая «БД» в файлах ======
 const DB_DIR = path.join(__dirname);
