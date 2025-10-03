@@ -51,7 +51,7 @@ function ageInRange(age, rangeKey) {
   switch (rangeKey) {
     case "18-22": return n >= 18 && n <= 22;
     case "23-33": return n >= 23 && n <= 33;
-    case "34+":   return n >= 34;
+    case "34+": return n >= 34;
     default: return false;
   }
 }
@@ -282,6 +282,102 @@ app.delete("/admin/ban/:id", requireAdmin, (req, res) => {
   writeJSON(BANS_FILE, bans);
   res.json({ ok: true, removed: banToPublic(removed) });
 });
+
+// В КОНЦЕ server.js, перед server.listen(...)
+app.get("/admin/panel", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Admin Panel</title>
+<style>body{font-family:system-ui;padding:20px;background:#0b1222;color:#e9f0ff}
+input,button,select{padding:8px;border-radius:6px;border:1px solid #334; background:#14203a;color:#e9f0ff}
+.card{background:#111a30;border:1px solid #27324a;padding:12px;border-radius:10px;margin:10px 0}
+h2{margin-top:24px}</style></head><body>
+<h1>Admin Panel</h1>
+
+<div class="card">
+  <h2>Token</h2>
+  <input id="token" placeholder="x-admin-token" style="width:320px">
+  <button onclick="loadReports()">Обновить жалобы</button>
+  <button onclick="loadBans()">Обновить баны</button>
+</div>
+
+<div class="card">
+  <h2>Создать бан</h2>
+  <div>userId: <input id="uid" placeholder="u_xxx" style="width:240px"></div>
+  <div>минут: <input id="mins" type="number" value="1440" style="width:120px"></div>
+  <div>причина: <input id="reason" value="rule violation" style="width:240px"></div>
+  <button onclick="doBan()">Ban</button>
+</div>
+
+<div class="card">
+  <h2>Жалобы</h2>
+  <div id="reports"></div>
+</div>
+
+<div class="card">
+  <h2>Баны</h2>
+  <div id="bans"></div>
+</div>
+
+<script>
+async function loadReports(){
+  const t = document.getElementById('token').value;
+  const r = await fetch('/admin/reports',{headers:{'x-admin-token':t}});
+  const j = await r.json();
+  const box = document.getElementById('reports');
+  box.innerHTML = '';
+  if(!j.ok){ box.textContent='Ошибка'; return; }
+  j.reports.sort((a,b)=>b.ts-a.ts).forEach(rep=>{
+    const el = document.createElement('div');
+    el.className='card';
+    el.innerHTML = '<b>'+rep.id+'</b><br>от: '+rep.fromUser+'<br>на: <code>'+ (rep.againstUser||'—') +'</code><br>причина: '+rep.reason+'<br><small>'+new Date(rep.ts).toLocaleString()+'</small><br><br>'
+      + '<button onclick="quickBan(\\''+(rep.againstUser||'')+'\\')">Бан на 24ч</button>';
+    box.appendChild(el);
+  });
+}
+async function loadBans(){
+  const t = document.getElementById('token').value;
+  const r = await fetch('/admin/bans',{headers:{'x-admin-token':t}});
+  const j = await r.json();
+  const box = document.getElementById('bans');
+  box.innerHTML = '';
+  if(!j.ok){ box.textContent='Ошибка'; return; }
+  j.bans.forEach(b=>{
+    const el = document.createElement('div');
+    el.className='card';
+    el.innerHTML = '<b>'+b.id+'</b><br>userId: '+(b.userId||'—')+'<br>ip: '+(b.ip||'—')+'<br>причина: '+b.reason+'<br>до: '+(b.until? new Date(b.until).toLocaleString():'∞')+'<br><br>'
+      + '<button onclick="unban(\\''+b.id+'\\')">Снять бан</button>';
+    box.appendChild(el);
+  });
+}
+async function doBan(){
+  const t = document.getElementById('token').value;
+  const userId = document.getElementById('uid').value.trim();
+  const minutes = +document.getElementById('mins').value || 60;
+  const reason = document.getElementById('reason').value || 'rule violation';
+  if(!userId){ alert('userId пуст'); return; }
+  const r = await fetch('/admin/ban',{method:'POST',headers:{'x-admin-token':t,'Content-Type':'application/json'},body:JSON.stringify({userId,minutes,reason})});
+  const j = await r.json();
+  alert(JSON.stringify(j,null,2));
+  loadBans();
+}
+async function unban(id){
+  const t = document.getElementById('token').value;
+  const r = await fetch('/admin/ban/'+id,{method:'DELETE',headers:{'x-admin-token':t}});
+  const j = await r.json();
+  alert(JSON.stringify(j,null,2));
+  loadBans();
+}
+async function quickBan(uid){
+  if(!uid){ alert('againstUser пуст у жалобы'); return; }
+  document.getElementById('uid').value = uid;
+  document.getElementById('mins').value = 1440;
+  await doBan();
+}
+</script>
+</body></html>`);
+});
+
 
 server.listen(process.env.PORT || 3000, () => {
   console.log("Server running on port", process.env.PORT || 3000);
