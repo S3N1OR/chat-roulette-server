@@ -11,21 +11,22 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ====== Конфиг администратора ======
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "Pers__2006)";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme_admin_token";
 
 // ====== Простая «БД» в файлах ======
-const DB_DIR = path.join(__dirname);
+const DB_DIR = __dirname;
 const BANS_FILE = path.join(DB_DIR, "bans.json");
 const REPORTS_FILE = path.join(DB_DIR, "reports.json");
+const CHATS_FILE = path.join(DB_DIR, "chats.json"); // лог чатов
 
-function readJSON(p) {
+function readJSON(p, fallback = []) {
   try {
-    if (!fs.existsSync(p)) return [];
+    if (!fs.existsSync(p)) return fallback;
     const raw = fs.readFileSync(p, "utf8");
-    return JSON.parse(raw || "[]");
+    return raw ? JSON.parse(raw) : fallback;
   } catch (e) {
     console.error("readJSON error", p, e);
-    return [];
+    return fallback;
   }
 }
 function writeJSON(p, data) {
@@ -36,62 +37,49 @@ function writeJSON(p, data) {
   }
 }
 
-let bans = readJSON(BANS_FILE);       // [{id,userId?,ip?,reason,until}]
-let reports = readJSON(REPORTS_FILE); // [{id,fromUser,againstUser,reason,chatId,ts}]
+let bans = readJSON(BANS_FILE, []);       // [{id,userId?,ip?,reason,until}]
+let reports = readJSON(REPORTS_FILE, []); // [{id,fromUser,againstUser,reason,chatId,ts}]
+let chats = readJSON(CHATS_FILE, []);     // [{id, users:[u1,u2], startedAt, messages:[{from,text,ts}], closedAt?}]
 
-// ====== Очередь ожидания для матчмейкинга ======
-let waiting = []; // массив сокетов (или их легких оберток)
+// ====== Матчмейкинг ======
+let waiting = []; // очередь ожидающих
 
-// ====== Возрастные диапазоны (18+) ======
+// Возрастные диапазоны (18+)
 const ALLOWED_RANGES = new Set(["18-22", "23-33", "34+"]);
-
 function ageInRange(age, rangeKey) {
   const n = parseInt(age, 10);
   if (Number.isNaN(n)) return false;
   switch (rangeKey) {
     case "18-22": return n >= 18 && n <= 22;
     case "23-33": return n >= 23 && n <= 33;
-    case "34+": return n >= 34;
+    case "34+":   return n >= 34;
     default: return false;
   }
 }
 
-// ====== Бан: проверки/утилиты ======
-function isBanActive(b) {
-  return !b.until || Date.now() < b.until;
-}
+// Бан
+function isBanActive(b) { return !b.until || Date.now() < b.until; }
 function getActiveBanFor(userId, ip) {
-  // prioritise userId, fallback to IP
-  const now = Date.now();
   return bans.find(
     (b) =>
       isBanActive(b) &&
       ((userId && b.userId && b.userId === userId) ||
-        (ip && b.ip && b.ip === ip))
+       (ip && b.ip && b.ip === ip))
   );
 }
 function banToPublic(b) {
-  return {
-    id: b.id,
-    userId: b.userId || null,
-    ip: b.ip || null,
-    reason: b.reason || "",
-    until: b.until || null,
-  };
+  return { id: b.id, userId: b.userId || null, ip: b.ip || null, reason: b.reason || "", until: b.until || null };
 }
 
-// ====== Матчинг по полу/возрасту/стране ======
+// Совпадение фильтров
 function matches(me, other) {
   if (!other) return false;
   const genderOk = me.targetGender === "any" || me.targetGender === other.myGender;
   const partnerGenderOk = other.targetGender === "any" || other.targetGender === me.myGender;
-
   const ageOk = !me.targetAges.length || me.targetAges.some((r) => ageInRange(other.myAge, r));
   const partnerAgeOk = !other.targetAges.length || other.targetAges.some((r) => ageInRange(me.myAge, r));
-
   const countryOk = !me.targetCountry || me.targetCountry === "any" || me.targetCountry === other.myCountry;
   const partnerCountryOk = !other.targetCountry || other.targetCountry === "any" || other.targetCountry === me.myCountry;
-
   return genderOk && partnerGenderOk && ageOk && partnerAgeOk && countryOk && partnerCountryOk;
 }
 
@@ -109,28 +97,59 @@ function getCountryCounts() {
   return counts;
 }
 
+// ====== Chat helpers ======
+function createChat(userA, userB) {
+  const id = "c_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+  const rec = {
+    id,
+    users: [userA || null, userB || null],
+    startedAt: Date.now(),
+    messages: [],
+    closedAt: null,
+  };
+  chats.push(rec);
+  writeJSON(CHATS_FILE, chats);
+  return rec;
+}
+function appendChatMessage(chatId, fromUser, text) {
+  const chat = chats.find((c) => c.id === chatId);
+  if (!chat) return;
+  chat.messages.push({ from: fromUser || null, text: String(text || ""), ts: Date.now() });
+  writeJSON(CHATS_FILE, chats);
+}
+function closeChat(chatId) {
+  const chat = chats.find((c) => c.id === chatId);
+  if (chat && !chat.closedAt) {
+    chat.closedAt = Date.now();
+    writeJSON(CHATS_FILE, chats);
+  }
+}
+function findLatestChatBetween(u1, u2) {
+  const pair = new Set([u1, u2]);
+  const arr = chats
+    .filter((c) => c.users.filter(Boolean).length === 2 && c.users.every((u) => pair.has(u)))
+    .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  return arr[0] || null;
+}
+
 // ====== Socket.io ======
 io.on("connection", (socket) => {
   const ip = socket.handshake.headers["x-forwarded-for"]?.split(",")[0]?.trim()
-    || socket.handshake.address
-    || "";
+    || socket.handshake.address || "";
   const userId = socket.handshake.auth?.userId || socket.handshake.query?.userId || null;
 
   socket.userId = userId;
   socket.userIp = ip;
 
-  // Проверяем бан при подключении
+  // проверка бана
   const ban = getActiveBanFor(userId, ip);
   if (ban) {
     socket.emit("banned", { reason: ban.reason || "Вы забанены", until: ban.until || null });
-    // чуть задержим, чтобы клиент успел показать сообщение
     setTimeout(() => socket.disconnect(true), 150);
     return;
   }
 
-  console.log("User connected:", socket.id, "userId:", userId, "ip:", ip);
-
-  // Статистика стран (для модалки на клиенте)
+  // статистика стран
   socket.on("get_country_counts", (ack) => {
     try {
       const counts = getCountryCounts();
@@ -140,50 +159,72 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Поиск партнёра
+  // поиск партнёра
   socket.on("find_partner", (data = {}) => {
     dropFromWaiting(socket);
     socket.partner = null;
 
-    const myGender =
-      data.myGender === "male" || data.myGender === "female" ? data.myGender : "any";
+    const myGender = (data.myGender === "male" || data.myGender === "female") ? data.myGender : "any";
     const myAge = parseInt(data.myAge, 10) || 18;
     const myCountry = (data.myCountry && String(data.myCountry)) || "any";
 
-    const targetGender =
-      data.targetGender === "male" || data.targetGender === "female" ? data.targetGender : "any";
+    const targetGender = (data.targetGender === "male" || data.targetGender === "female") ? data.targetGender : "any";
     let targetAges = Array.isArray(data.targetAges) ? data.targetAges : [];
     targetAges = targetAges.filter((k) => ALLOWED_RANGES.has(k));
-
-    const targetCountry =
-      data.targetCountry && String(data.targetCountry).length ? String(data.targetCountry) : "any";
+    const targetCountry = data.targetCountry ? String(data.targetCountry) : "any";
 
     socket.profile = { myGender, myAge, myCountry, targetGender, targetAges, targetCountry };
 
-    const partnerIndex = waiting.findIndex((s) => matches(socket.profile, s.profile));
-    if (partnerIndex !== -1) {
-      const partner = waiting[partnerIndex];
-      waiting.splice(partnerIndex, 1);
+    const idx = waiting.findIndex((s) => matches(socket.profile, s.profile));
+    if (idx !== -1) {
+      const partner = waiting[idx];
+      waiting.splice(idx, 1);
+
+      // создаём чат
+      const chat = createChat(socket.userId || null, partner.userId || null);
+      socket.chatId = chat.id;
+      partner.chatId = chat.id;
+
       socket.partner = partner.id;
       partner.partner = socket.id;
 
-      socket.emit("partner_found", { partnerId: partner.id });
-      partner.emit("partner_found", { partnerId: socket.id });
-      console.log("Paired:", socket.id, "<->", partner.id);
+      socket.emit("partner_found", {
+        partnerId: partner.id,
+        partnerUserId: partner.userId || null,
+        chatId: chat.id,
+      });
+      partner.emit("partner_found", {
+        partnerId: socket.id,
+        partnerUserId: socket.userId || null,
+        chatId: chat.id,
+      });
+
+      console.log("Paired:", socket.id, "<->", partner.id, "chat:", chat.id);
     } else {
       waiting.push(socket);
       console.log("Added to waiting:", socket.id, socket.profile);
     }
   });
 
-  // Сообщения
+  // сообщение
   socket.on("message", (msg) => {
-    if (socket.partner) io.to(socket.partner).emit("message", msg);
+    if (socket.partner) {
+      io.to(socket.partner).emit("message", msg);
+      // лог в чат
+      if (socket.chatId) appendChatMessage(socket.chatId, socket.userId || null, msg);
+    }
   });
 
-  // Завершение чата
+  // индикатор набора
+  socket.on("typing", (payload = {}) => {
+    if (!socket.partner) return;
+    io.to(socket.partner).emit("typing", { isTyping: !!payload.isTyping });
+  });
+
+  // завершить чат
   socket.on("finish_chat", () => {
     dropFromWaiting(socket);
+    if (socket.chatId) closeChat(socket.chatId);
     if (socket.partner) {
       io.to(socket.partner).emit("partner_left");
       const partnerSocket = io.sockets.sockets.get(socket.partner);
@@ -192,29 +233,39 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Жалоба на пользователя
-  // payload: { againstUser: "<userId или socketId>", reason: "<string>", chatId?: "<id>" }
+  // жалоба
+  // payload: { againstUser?: string, reason: string, chatId?: string }
   socket.on("report_user", (payload = {}, ack) => {
     try {
+      let againstUser = payload.againstUser || null;
+      // если не прислали — берем у текущего партнёра
+      if (!againstUser && socket.partner) {
+        const partnerSocket = io.sockets.sockets.get(socket.partner);
+        if (partnerSocket) againstUser = partnerSocket.userId || partnerSocket.id;
+      }
+      const chatId = payload.chatId || socket.chatId || null;
+
       const rec = {
-        id: "r_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+        id: "r_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
         fromUser: socket.userId || socket.id,
-        againstUser: payload.againstUser || null,
+        againstUser,
         reason: String(payload.reason || "unspecified"),
-        chatId: payload.chatId || null,
+        chatId,
         ts: Date.now(),
       };
       reports.push(rec);
       writeJSON(REPORTS_FILE, reports);
+
       if (typeof ack === "function") ack({ ok: true });
     } catch (e) {
       if (typeof ack === "function") ack({ ok: false, error: String(e) });
     }
   });
 
-  // Отключение
+  // отключение
   socket.on("disconnect", () => {
     dropFromWaiting(socket);
+    if (socket.chatId) closeChat(socket.chatId);
     if (socket.partner) {
       io.to(socket.partner).emit("partner_left");
       const partnerSocket = io.sockets.sockets.get(socket.partner);
@@ -233,12 +284,40 @@ function requireAdmin(req, res, next) {
 }
 
 // ====== Админ-эндпоинты ======
+
 // Список жалоб
 app.get("/admin/reports", requireAdmin, (req, res) => {
-  res.json({ ok: true, reports });
+  // сортируем по свежести
+  const list = [...reports].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  res.json({ ok: true, reports: list });
 });
 
-// Создать бан (мгновенно кикнет онлайн-пользователей)
+// Логи чата
+// GET /admin/chat?chatId=...   ИЛИ   /admin/chat?userA=u_..&userB=u_..
+app.get("/admin/chat", requireAdmin, (req, res) => {
+  const { chatId, userA, userB } = req.query || {};
+  let chat = null;
+
+  if (chatId) {
+    chat = chats.find((c) => c.id === chatId);
+  } else if (userA && userB) {
+    chat = findLatestChatBetween(String(userA), String(userB));
+  }
+
+  if (!chat) return res.status(404).json({ ok: false, error: "chat not found" });
+  res.json({
+    ok: true,
+    chat: {
+      id: chat.id,
+      users: chat.users,
+      startedAt: chat.startedAt,
+      closedAt: chat.closedAt || null,
+      messages: chat.messages,
+    },
+  });
+});
+
+// Создать бан
 app.post("/admin/ban", requireAdmin, (req, res) => {
   const { userId, ip, minutes = 60, reason = "rule violation" } = req.body || {};
   if (!userId && !ip) return res.status(400).json({ ok: false, error: "userId or ip required" });
@@ -253,13 +332,12 @@ app.post("/admin/ban", requireAdmin, (req, res) => {
   bans.push(ban);
   writeJSON(BANS_FILE, bans);
 
-  // Мгновенно отключаем всех подходящих
-  for (const [id, s] of io.sockets.sockets) {
-    if (!isBanActive(ban)) continue;
+  // кикнем онлайн-подходящих
+  for (const [, s] of io.sockets.sockets) {
     const hit =
       (ban.userId && s.userId && s.userId === ban.userId) ||
       (ban.ip && s.userIp && s.userIp === ban.ip);
-    if (hit) {
+    if (hit && isBanActive(ban)) {
       s.emit("banned", { reason, until });
       setTimeout(() => s.disconnect(true), 150);
     }
@@ -268,12 +346,12 @@ app.post("/admin/ban", requireAdmin, (req, res) => {
   res.json({ ok: true, ban: banToPublic(ban) });
 });
 
-// Список банов (активные и истёкшие)
+// Список банов
 app.get("/admin/bans", requireAdmin, (req, res) => {
   res.json({ ok: true, bans: bans.map(banToPublic) });
 });
 
-// Удалить бан
+// Снять бан
 app.delete("/admin/ban/:id", requireAdmin, (req, res) => {
   const { id } = req.params;
   const i = bans.findIndex((b) => b.id === id);
@@ -283,102 +361,306 @@ app.delete("/admin/ban/:id", requireAdmin, (req, res) => {
   res.json({ ok: true, removed: banToPublic(removed) });
 });
 
-// В КОНЦЕ server.js, перед server.listen(...)
+// ====== Красивая админ-панель ======
 app.get("/admin/panel", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Admin Panel</title>
-<style>body{font-family:system-ui;padding:20px;background:#0b1222;color:#e9f0ff}
-input,button,select{padding:8px;border-radius:6px;border:1px solid #334; background:#14203a;color:#e9f0ff}
-.card{background:#111a30;border:1px solid #27324a;padding:12px;border-radius:10px;margin:10px 0}
-h2{margin-top:24px}</style></head><body>
-<h1>Admin Panel</h1>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Admin • Chat Roulette</title>
+<style>
+:root{
+  --bg:#0b1222; --card:#101a33; --card2:#0f1730; --border:#26324b; --muted:#9fbfff;
+  --txt:#e8f2ff; --accent:#6f3cff; --accent2:#33b9ff; --danger:#ff5d5d; --ok:#20c997;
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;background:linear-gradient(140deg,#0b1222,#0b1428 40%,#0a0f1f);color:var(--txt)}
+.container{max-width:1100px;margin:30px auto;padding:0 18px}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.title{font-weight:800;font-size:22px;letter-spacing:.3px}
+.badge{font-size:12px;color:var(--bg);background:linear-gradient(90deg,var(--accent),var(--accent2));padding:6px 10px;border-radius:999px;font-weight:800}
+.grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
+.card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}
+.card .head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.card .head h3{margin:0;font-size:16px;font-weight:800}
+.card .body{padding:14px 16px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input,button,select{border:1px solid var(--border);background:#111a30;color:var(--txt);border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
+button{cursor:pointer}
+button.primary{background:linear-gradient(90deg,var(--accent),var(--accent2));border:none;color:#001220;font-weight:900}
+button.line{background:transparent;border:1px solid var(--border)}
+button.danger{background:var(--danger);border:none}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:10px}
+.kpi{background:linear-gradient(180deg,#0e1832,#0d162c);border:1px solid var(--border);border-radius:12px;padding:12px}
+.kpi .k{font-size:12px;color:var(--muted)}
+.kpi .v{font-size:20px;font-weight:800;margin-top:6px}
+.table{width:100%;border-collapse:separate;border-spacing:0 8px}
+.table th{font-size:12px;color:var(--muted);text-align:left;padding:6px 8px}
+.table td{background:#0f1934;border:1px solid var(--border);padding:10px;border-left:none;border-right:none}
+.table tr td:first-child{border-top-left-radius:10px;border-bottom-left-radius:10px;border-left:1px solid var(--border)}
+.table tr td:last-child{border-top-right-radius:10px;border-bottom-right-radius:10px;border-right:1px solid var(--border)}
+.code{font-family:ui-monospace,Consolas,monospace;background:#0a1226;border:1px solid var(--border);padding:8px 10px;border-radius:8px}
+.muted{color:var(--muted)}
+.hr{height:1px;background:var(--border);margin:12px 0}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.footer{opacity:.6;text-align:center;margin-top:14px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;padding:18px}
+.modal{max-width:900px;width:100%;background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--border);border-radius:14px}
+.modal .head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--border)}
+.modal .head h3{margin:0;font-weight:800}
+.modal .body{padding:14px}
+.chatbox{height:420px;overflow:auto;border:1px solid var(--border);border-radius:10px;background:#0a1328;padding:10px}
+.msg{padding:8px 10px;border-radius:8px;margin:6px 0;max-width:74%}
+.me{background:#6f3cff;color:#fff;margin-left:auto}
+.them{background:#243153}
+.msg .ts{display:block;font-size:11px;opacity:.8;margin-top:4px}
+a.link{color:#9fbfff;text-decoration:none;border-bottom:1px dashed #3f67ff}
+.empty{padding:30px;text-align:center;color:#9fbfff}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">Админ-панель <span class="badge">moderation</span></div>
+      <div class="row">
+        <input id="token" placeholder="x-admin-token" style="min-width:260px">
+        <button class="line" onclick="refreshAll()">Обновить всё</button>
+      </div>
+    </div>
 
-<div class="card">
-  <h2>Token</h2>
-  <input id="token" placeholder="x-admin-token" style="width:320px">
-  <button onclick="loadReports()">Обновить жалобы</button>
-  <button onclick="loadBans()">Обновить баны</button>
-</div>
+    <div class="kpis">
+      <div class="kpi"><div class="k">Всего жалоб</div><div class="v" id="kpi_reports">—</div></div>
+      <div class="kpi"><div class="k">Активные баны</div><div class="v" id="kpi_bans">—</div></div>
+      <div class="kpi"><div class="k">Всего чатов</div><div class="v" id="kpi_chats">—</div></div>
+    </div>
 
-<div class="card">
-  <h2>Создать бан</h2>
-  <div>userId: <input id="uid" placeholder="u_xxx" style="width:240px"></div>
-  <div>минут: <input id="mins" type="number" value="1440" style="width:120px"></div>
-  <div>причина: <input id="reason" value="rule violation" style="width:240px"></div>
-  <button onclick="doBan()">Ban</button>
-</div>
+    <div class="grid">
+      <div class="card">
+        <div class="head"><h3>Жалобы</h3>
+          <div class="row">
+            <button class="line" onclick="loadReports()">Обновить</button>
+          </div>
+        </div>
+        <div class="body">
+          <table class="table" style="width:100%">
+            <thead>
+              <tr>
+                <th>От</th>
+                <th>На</th>
+                <th>Причина</th>
+                <th>Время</th>
+                <th>Чат</th>
+                <th style="text-align:right">Действия</th>
+              </tr>
+            </thead>
+            <tbody id="reports_tbody">
+              <tr><td colspan="6" class="empty">Данных пока нет</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
 
-<div class="card">
-  <h2>Жалобы</h2>
-  <div id="reports"></div>
-</div>
+      <div class="card">
+        <div class="head"><h3>Баны</h3>
+          <div class="row">
+            <button class="line" onclick="loadBans()">Обновить</button>
+          </div>
+        </div>
+        <div class="body">
+          <div class="row" style="margin-bottom:10px">
+            <input id="uid" placeholder="userId (u_...)" style="flex:1">
+            <input id="mins" type="number" value="1440" style="width:110px">
+            <input id="reason" value="rule violation" placeholder="причина" style="flex:1">
+            <button class="primary" onclick="doBan()">Забанить</button>
+          </div>
+          <div id="bans_list"></div>
+        </div>
+      </div>
+    </div>
 
-<div class="card">
-  <h2>Баны</h2>
-  <div id="bans"></div>
-</div>
+    <div class="footer">© Admin • Chat Roulette</div>
+  </div>
+
+  <!-- Модалка чата -->
+  <div id="modal-bg" class="modal-bg" onclick="closeModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="head">
+        <h3 id="chat_title">История чата</h3>
+        <button class="line" onclick="hideModal()">Закрыть</button>
+      </div>
+      <div class="body">
+        <div class="chatbox" id="chat_box"><div class="empty">Нет сообщений</div></div>
+      </div>
+    </div>
+  </div>
 
 <script>
+const qs = (s) => document.querySelector(s);
+const el = (h, cls) => { const e = document.createElement(h); if(cls) e.className = cls; return e; };
+function token(){ return qs('#token').value.trim(); }
+function fmtTs(t){ try{ return new Date(t).toLocaleString('ru-RU'); }catch{ return '';} }
+
+async function api(path, opt={}){
+  const r = await fetch(path, { ...opt, headers: { ...(opt.headers||{}), 'x-admin-token': token() }});
+  return r.json();
+}
+
 async function loadReports(){
-  const t = document.getElementById('token').value;
-  const r = await fetch('/admin/reports',{headers:{'x-admin-token':t}});
-  const j = await r.json();
-  const box = document.getElementById('reports');
-  box.innerHTML = '';
-  if(!j.ok){ box.textContent='Ошибка'; return; }
-  j.reports.sort((a,b)=>b.ts-a.ts).forEach(rep=>{
-    const el = document.createElement('div');
-    el.className='card';
-    el.innerHTML = '<b>'+rep.id+'</b><br>от: '+rep.fromUser+'<br>на: <code>'+ (rep.againstUser||'—') +'</code><br>причина: '+rep.reason+'<br><small>'+new Date(rep.ts).toLocaleString()+'</small><br><br>'
-      + '<button onclick="quickBan(\\''+(rep.againstUser||'')+'\\')">Бан на 24ч</button>';
-    box.appendChild(el);
-  });
+  const data = await api('/admin/reports');
+  const tbody = qs('#reports_tbody'); tbody.innerHTML = '';
+  if(!data.ok || !data.reports.length){
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">Жалоб нет</td></tr>';
+    qs('#kpi_reports').textContent = data.ok ? data.reports.length : '—';
+    return;
+  }
+  qs('#kpi_reports').textContent = data.reports.length;
+  for(const rep of data.reports){
+    const tr = el('tr');
+    const tdFrom = el('td'); tdFrom.innerHTML = '<span class="code">'+(rep.fromUser||'—')+'</span>';
+    const tdTo = el('td'); tdTo.innerHTML = rep.againstUser ? '<span class="code">'+rep.againstUser+'</span>' : '<span class="muted">—</span>';
+    const tdReason = el('td'); tdReason.textContent = rep.reason || '—';
+    const tdTime = el('td'); tdTime.innerHTML = '<span class="muted">'+fmtTs(rep.ts)+'</span>';
+    const tdChat = el('td');
+    if(rep.chatId){
+      const a = el('a','link'); a.textContent = rep.chatId; a.href='#'; a.onclick=(e)=>{e.preventDefault(); openChat({chatId:rep.chatId, title: 'Чат '+rep.chatId});};
+      tdChat.appendChild(a);
+    } else {
+      // кнопка "по парам"
+      const btn = el('button','line'); btn.textContent='по паре'; btn.onclick=()=>openChat({userA:rep.fromUser, userB:rep.againstUser, title: 'Переписка пары'});
+      tdChat.appendChild(btn);
+    }
+    const tdAct = el('td'); tdAct.style.textAlign='right';
+    const actions = el('div','actions');
+
+    const ban24 = el('button','line'); ban24.textContent='Бан 24ч';
+    ban24.onclick = ()=>quickBan(rep.againstUser || '');
+    const banCustom = el('button','line'); banCustom.textContent='Бан...';
+    banCustom.onclick = async ()=>{
+      const mins = prompt('Минуты бана', '1440');
+      if(!mins) return;
+      await doBan(rep.againstUser || '', parseInt(mins,10)||60);
+    };
+
+    actions.appendChild(ban24);
+    actions.appendChild(banCustom);
+    tdAct.appendChild(actions);
+
+    tr.appendChild(tdFrom);
+    tr.appendChild(tdTo);
+    tr.appendChild(tdReason);
+    tr.appendChild(tdTime);
+    tr.appendChild(tdChat);
+    tr.appendChild(tdAct);
+    tbody.appendChild(tr);
+  }
 }
-async function loadBans(){
-  const t = document.getElementById('token').value;
-  const r = await fetch('/admin/bans',{headers:{'x-admin-token':t}});
-  const j = await r.json();
-  const box = document.getElementById('bans');
-  box.innerHTML = '';
-  if(!j.ok){ box.textContent='Ошибка'; return; }
-  j.bans.forEach(b=>{
-    const el = document.createElement('div');
-    el.className='card';
-    el.innerHTML = '<b>'+b.id+'</b><br>userId: '+(b.userId||'—')+'<br>ip: '+(b.ip||'—')+'<br>причина: '+b.reason+'<br>до: '+(b.until? new Date(b.until).toLocaleString():'∞')+'<br><br>'
-      + '<button onclick="unban(\\''+b.id+'\\')">Снять бан</button>';
-    box.appendChild(el);
-  });
+
+async function openChat({chatId, userA, userB, title}){
+  try{
+    let url = '/admin/chat';
+    if(chatId){ url += '?chatId='+encodeURIComponent(chatId); }
+    else if(userA && userB){ url += '?userA='+encodeURIComponent(userA)+'&userB='+encodeURIComponent(userB); }
+    else { alert('Недостаточно данных для загрузки чата'); return; }
+
+    const data = await api(url);
+    if(!data.ok){ alert('Чат не найден'); return; }
+
+    qs('#chat_title').textContent = title || ('Чат '+data.chat.id);
+    const box = qs('#chat_box'); box.innerHTML = '';
+
+    if(!data.chat.messages || !data.chat.messages.length){
+      box.innerHTML = '<div class="empty">Сообщений нет</div>';
+    } else {
+      for(const m of data.chat.messages){
+        const wrap = el('div','msg '+(m.from === data.chat.users[0] ? 'me':'them'));
+        wrap.textContent = m.text;
+        const ts = el('span','ts'); ts.textContent = fmtTs(m.ts);
+        wrap.appendChild(ts);
+        box.appendChild(wrap);
+      }
+      box.scrollTop = box.scrollHeight;
+    }
+    showModal();
+  }catch(e){ console.error(e); alert('Ошибка загрузки чата'); }
 }
-async function doBan(){
-  const t = document.getElementById('token').value;
-  const userId = document.getElementById('uid').value.trim();
-  const minutes = +document.getElementById('mins').value || 60;
-  const reason = document.getElementById('reason').value || 'rule violation';
+
+function showModal(){ qs('#modal-bg').style.display='flex'; }
+function hideModal(){ qs('#modal-bg').style.display='none'; }
+function closeModal(e){ if(e.target.id==='modal-bg') hideModal(); }
+
+async function doBan(userId, minutes){
+  userId = userId || qs('#uid').value.trim();
+  minutes = minutes || parseInt(qs('#mins').value,10) || 60;
+  const reason = qs('#reason').value || 'rule violation';
   if(!userId){ alert('userId пуст'); return; }
-  const r = await fetch('/admin/ban',{method:'POST',headers:{'x-admin-token':t,'Content-Type':'application/json'},body:JSON.stringify({userId,minutes,reason})});
-  const j = await r.json();
-  alert(JSON.stringify(j,null,2));
+  const r = await api('/admin/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId,minutes,reason})});
+  if(!r.ok) { alert('Ошибка: '+(r.error||'')); return; }
+  alert('Забанен до: '+(r.ban.until? new Date(r.ban.until).toLocaleString('ru-RU') : '∞'));
   loadBans();
 }
+async function quickBan(uid){ if(!uid){ alert('Нет againstUser'); return; } qs('#uid').value = uid; qs('#mins').value = 1440; await doBan(uid, 1440); }
+
+async function loadBans(){
+  const data = await api('/admin/bans');
+  const box = qs('#bans_list'); box.innerHTML='';
+  if(!data.ok || !data.bans.length){ box.innerHTML='<div class="empty">Банов нет</div>'; qs('#kpi_bans').textContent='0'; return; }
+  qs('#kpi_bans').textContent = data.bans.filter(b=>!b.until || Date.now()<b.until).length;
+  for(const b of data.bans){
+    const card = el('div','card'); card.style.margin='8px 0';
+    const body = el('div','body');
+    body.innerHTML = '<div class="row" style="justify-content:space-between">'
+      + '<div><b>'+b.id+'</b><div class="muted">userId: '+(b.userId||'—')+' | ip: '+(b.ip||'—')+'</div></div>'
+      + '<div class="row"><span class="muted">до: '+(b.until? new Date(b.until).toLocaleString('ru-RU') : '∞')+'</span>'
+      + '<button class="danger" onclick="unban(\\''+b.id+'\\')" style="margin-left:10px">Снять</button></div>'
+      + '</div>';
+    card.appendChild(body);
+    box.appendChild(card);
+  }
+}
+
 async function unban(id){
-  const t = document.getElementById('token').value;
-  const r = await fetch('/admin/ban/'+id,{method:'DELETE',headers:{'x-admin-token':t}});
-  const j = await r.json();
-  alert(JSON.stringify(j,null,2));
+  const ok = confirm('Снять бан '+id+'?');
+  if(!ok) return;
+  const r = await api('/admin/ban/'+id,{method:'DELETE'});
+  if(!r.ok){ alert('Ошибка'); return; }
   loadBans();
 }
-async function quickBan(uid){
-  if(!uid){ alert('againstUser пуст у жалобы'); return; }
-  document.getElementById('uid').value = uid;
-  document.getElementById('mins').value = 1440;
-  await doBan();
+
+async function loadKpis(){
+  // оценим число чатов по файлу (без отдельного эндпоинта)
+  try{
+    const r1 = await api('/admin/reports');
+    qs('#kpi_reports').textContent = r1.ok ? r1.reports.length : '—';
+  }catch{}
+  try{
+    const r2 = await api('/admin/bans');
+    qs('#kpi_bans').textContent = r2.ok ? r2.bans.filter(b=>!b.until || Date.now()<b.until).length : '—';
+  }catch{}
+  // только для визуального KPI — читаем количество чатов по HEAD-трику не получится,
+  // поэтому отобразим приблизительное значение на основе отчётов с chatId
+  try{
+    const r1 = await api('/admin/reports');
+    const uniq = new Set((r1.reports||[]).map(x=>x.chatId).filter(Boolean));
+    qs('#kpi_chats').textContent = uniq.size || '—';
+  }catch{}
 }
+
+async function refreshAll(){
+  await Promise.all([loadReports(), loadBans()]);
+  await loadKpis();
+}
+
+// автозагрузка
+refreshAll();
 </script>
-</body></html>`);
+</body>
+</html>`);
 });
 
-
+// ====== Запуск ======
 server.listen(process.env.PORT || 3000, () => {
   console.log("Server running on port", process.env.PORT || 3000);
 });
