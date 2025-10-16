@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ====== Конфиг администратора ======
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "changeme_admin_token";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "aliev";
 
 // ====== Простая «БД» в файлах ======
 const DB_DIR = __dirname;
@@ -287,13 +287,11 @@ function requireAdmin(req, res, next) {
 
 // Список жалоб
 app.get("/admin/reports", requireAdmin, (req, res) => {
-  // сортируем по свежести
   const list = [...reports].sort((a, b) => (b.ts || 0) - (a.ts || 0));
   res.json({ ok: true, reports: list });
 });
 
 // Логи чата
-// GET /admin/chat?chatId=...   ИЛИ   /admin/chat?userA=u_..&userB=u_..
 app.get("/admin/chat", requireAdmin, (req, res) => {
   const { chatId, userA, userB } = req.query || {};
   let chat = null;
@@ -351,7 +349,7 @@ app.get("/admin/bans", requireAdmin, (req, res) => {
   res.json({ ok: true, bans: bans.map(banToPublic) });
 });
 
-// Снять бан
+// Снять бан по ID записи
 app.delete("/admin/ban/:id", requireAdmin, (req, res) => {
   const { id } = req.params;
   const i = bans.findIndex((b) => b.id === id);
@@ -361,7 +359,21 @@ app.delete("/admin/ban/:id", requireAdmin, (req, res) => {
   res.json({ ok: true, removed: banToPublic(removed) });
 });
 
-// ====== Красивая админ-панель ======
+// Снять все баны пользователя и/или IP (НОВЫЙ, чтобы точно снялось)
+app.post("/admin/unban", requireAdmin, (req, res) => {
+  const { userId, ip } = req.body || {};
+  if (!userId && !ip) return res.status(400).json({ ok: false, error: "userId or ip required" });
+  const before = bans.length;
+  bans = bans.filter((b) => !(
+    (userId && b.userId === userId) ||
+    (ip && b.ip === ip)
+  ));
+  writeJSON(BANS_FILE, bans);
+  const removedCount = before - bans.length;
+  res.json({ ok: true, removedCount });
+});
+
+// ====== Красивая, адаптивная админ-панель ======
 app.get("/admin/panel", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`<!doctype html>
@@ -379,12 +391,12 @@ app.get("/admin/panel", (req, res) => {
 *{box-sizing:border-box}
 body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;background:linear-gradient(140deg,#0b1222,#0b1428 40%,#0a0f1f);color:var(--txt)}
 .container{max-width:1100px;margin:30px auto;padding:0 18px}
-.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.header{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap}
 .title{font-weight:800;font-size:22px;letter-spacing:.3px}
 .badge{font-size:12px;color:var(--bg);background:linear-gradient(90deg,var(--accent),var(--accent2));padding:6px 10px;border-radius:999px;font-weight:800}
 .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
 .card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}
-.card .head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.card .head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);gap:8px;flex-wrap:wrap}
 .card .head h3{margin:0;font-size:16px;font-weight:800}
 .card .body{padding:14px 16px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -399,10 +411,10 @@ button.danger{background:var(--danger);border:none}
 .kpi .v{font-size:20px;font-weight:800;margin-top:6px}
 .table{width:100%;border-collapse:separate;border-spacing:0 8px}
 .table th{font-size:12px;color:var(--muted);text-align:left;padding:6px 8px}
-.table td{background:#0f1934;border:1px solid var(--border);padding:10px;border-left:none;border-right:none}
+.table td{background:#0f1934;border:1px solid var(--border);padding:10px;border-left:none;border-right:none;vertical-align:top}
 .table tr td:first-child{border-top-left-radius:10px;border-bottom-left-radius:10px;border-left:1px solid var(--border)}
 .table tr td:last-child{border-top-right-radius:10px;border-bottom-right-radius:10px;border-right:1px solid var(--border)}
-.code{font-family:ui-monospace,Consolas,monospace;background:#0a1226;border:1px solid var(--border);padding:8px 10px;border-radius:8px}
+.code{font-family:ui-monospace,Consolas,monospace;background:#0a1226;border:1px solid var(--border);padding:4px 6px;border-radius:6px}
 .muted{color:var(--muted)}
 .hr{height:1px;background:var(--border);margin:12px 0}
 .actions{display:flex;gap:6px;flex-wrap:wrap}
@@ -419,6 +431,12 @@ button.danger{background:var(--danger);border:none}
 .msg .ts{display:block;font-size:11px;opacity:.8;margin-top:4px}
 a.link{color:#9fbfff;text-decoration:none;border-bottom:1px dashed #3f67ff}
 .empty{padding:30px;text-align:center;color:#9fbfff}
+@media (max-width: 820px){
+  .container{margin:16px auto}
+  .grid{grid-template-columns:1fr}
+  .kpis{grid-template-columns:1fr}
+  .table th:nth-child(4), .table td:nth-child(4){display:none} /* скрыть "Время" на узких экранах */
+}
 </style>
 </head>
 <body>
@@ -426,7 +444,7 @@ a.link{color:#9fbfff;text-decoration:none;border-bottom:1px dashed #3f67ff}
     <div class="header">
       <div class="title">Админ-панель <span class="badge">moderation</span></div>
       <div class="row">
-        <input id="token" placeholder="x-admin-token" style="min-width:260px">
+        <input id="token" placeholder="x-admin-token" style="min-width:220px">
         <button class="line" onclick="refreshAll()">Обновить всё</button>
       </div>
     </div>
@@ -434,7 +452,7 @@ a.link{color:#9fbfff;text-decoration:none;border-bottom:1px dashed #3f67ff}
     <div class="kpis">
       <div class="kpi"><div class="k">Всего жалоб</div><div class="v" id="kpi_reports">—</div></div>
       <div class="kpi"><div class="k">Активные баны</div><div class="v" id="kpi_bans">—</div></div>
-      <div class="kpi"><div class="k">Всего чатов</div><div class="v" id="kpi_chats">—</div></div>
+      <div class="kpi"><div class="k">Всего чатов*</div><div class="v" id="kpi_chats">—</div></div>
     </div>
 
     <div class="grid">
@@ -471,10 +489,11 @@ a.link{color:#9fbfff;text-decoration:none;border-bottom:1px dashed #3f67ff}
         </div>
         <div class="body">
           <div class="row" style="margin-bottom:10px">
-            <input id="uid" placeholder="userId (u_...)" style="flex:1">
+            <input id="uid" placeholder="userId (u_...)" style="flex:1;min-width:180px">
             <input id="mins" type="number" value="1440" style="width:110px">
-            <input id="reason" value="rule violation" placeholder="причина" style="flex:1">
+            <input id="reason" value="rule violation" placeholder="причина" style="flex:1;min-width:160px">
             <button class="primary" onclick="doBan()">Забанить</button>
+            <button class="line" onclick="unbanByUser()">Снять все баны пользователя</button>
           </div>
           <div id="bans_list"></div>
         </div>
@@ -528,7 +547,6 @@ async function loadReports(){
       const a = el('a','link'); a.textContent = rep.chatId; a.href='#'; a.onclick=(e)=>{e.preventDefault(); openChat({chatId:rep.chatId, title: 'Чат '+rep.chatId});};
       tdChat.appendChild(a);
     } else {
-      // кнопка "по парам"
       const btn = el('button','line'); btn.textContent='по паре'; btn.onclick=()=>openChat({userA:rep.fromUser, userB:rep.againstUser, title: 'Переписка пары'});
       tdChat.appendChild(btn);
     }
@@ -543,9 +561,12 @@ async function loadReports(){
       if(!mins) return;
       await doBan(rep.againstUser || '', parseInt(mins,10)||60);
     };
+    const unbanAll = el('button','danger'); unbanAll.textContent='Снять все баны';
+    unbanAll.onclick = ()=>unbanByUser(rep.againstUser||'');
 
     actions.appendChild(ban24);
     actions.appendChild(banCustom);
+    actions.appendChild(unbanAll);
     tdAct.appendChild(actions);
 
     tr.appendChild(tdFrom);
@@ -599,7 +620,7 @@ async function doBan(userId, minutes){
   const r = await api('/admin/ban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId,minutes,reason})});
   if(!r.ok) { alert('Ошибка: '+(r.error||'')); return; }
   alert('Забанен до: '+(r.ban.until? new Date(r.ban.until).toLocaleString('ru-RU') : '∞'));
-  loadBans();
+  await loadBans();
 }
 async function quickBan(uid){ if(!uid){ alert('Нет againstUser'); return; } qs('#uid').value = uid; qs('#mins').value = 1440; await doBan(uid, 1440); }
 
@@ -611,26 +632,34 @@ async function loadBans(){
   for(const b of data.bans){
     const card = el('div','card'); card.style.margin='8px 0';
     const body = el('div','body');
-    body.innerHTML = '<div class="row" style="justify-content:space-between">'
-      + '<div><b>'+b.id+'</b><div class="muted">userId: '+(b.userId||'—')+' | ip: '+(b.ip||'—')+'</div></div>'
-      + '<div class="row"><span class="muted">до: '+(b.until? new Date(b.until).toLocaleString('ru-RU') : '∞')+'</span>'
-      + '<button class="danger" onclick="unban(\\''+b.id+'\\')" style="margin-left:10px">Снять</button></div>'
-      + '</div>';
+    body.innerHTML = '<div class="row" style="justify-content:space-between;gap:10px">'
+      + '<div><b>'+b.id+'</b><div class="muted">userId: '+(b.userId||'—')+' | ip: '+(b.ip||'—')+'</div><div class="muted">причина: '+(b.reason||'—')+'</div></div>'
+      + '<div class="row" style="min-width:220px;justify-content:flex-end"><span class="muted">до: '+(b.until? new Date(b.until).toLocaleString('ru-RU') : '∞')+'</span>'
+      + '<button class="danger" onclick="unbanId(\\''+b.id+'\\')" style="margin-left:10px">Снять ID</button>'
+      + (b.userId? '<button class="line" onclick="unbanByUser(\\''+b.userId+'\\')" style="margin-left:6px">Снять все по userId</button>' : '')
+      + '</div></div>';
     card.appendChild(body);
     box.appendChild(card);
   }
 }
 
-async function unban(id){
+async function unbanId(id){
   const ok = confirm('Снять бан '+id+'?');
   if(!ok) return;
   const r = await api('/admin/ban/'+id,{method:'DELETE'});
   if(!r.ok){ alert('Ошибка'); return; }
-  loadBans();
+  await loadBans();
+}
+async function unbanByUser(uid){
+  uid = uid || qs('#uid').value.trim();
+  if(!uid){ alert('Введите userId'); return; }
+  const r = await api('/admin/unban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:uid})});
+  if(!r.ok){ alert('Ошибка'); return; }
+  alert('Снято записей: '+r.removedCount);
+  await loadBans();
 }
 
 async function loadKpis(){
-  // оценим число чатов по файлу (без отдельного эндпоинта)
   try{
     const r1 = await api('/admin/reports');
     qs('#kpi_reports').textContent = r1.ok ? r1.reports.length : '—';
@@ -639,8 +668,6 @@ async function loadKpis(){
     const r2 = await api('/admin/bans');
     qs('#kpi_bans').textContent = r2.ok ? r2.bans.filter(b=>!b.until || Date.now()<b.until).length : '—';
   }catch{}
-  // только для визуального KPI — читаем количество чатов по HEAD-трику не получится,
-  // поэтому отобразим приблизительное значение на основе отчётов с chatId
   try{
     const r1 = await api('/admin/reports');
     const uniq = new Set((r1.reports||[]).map(x=>x.chatId).filter(Boolean));
